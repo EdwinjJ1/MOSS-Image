@@ -117,7 +117,9 @@ def _staged_pipeline_class(module):
             key = ((prompt,) if isinstance(prompt, str) else tuple(prompt), max_sequence_length)
             if key not in self.embeddings:
                 self.use_text_encoder()
-                self.embeddings[key] = super().encode_prompt(prompt, max_sequence_length)
+                # An autograd graph would keep the released text encoder alive in the cache.
+                with torch.no_grad():
+                    self.embeddings[key] = super().encode_prompt(prompt, max_sequence_length)
                 while len(self.embeddings) > CACHED_PROMPTS:
                     self.embeddings.popitem(last=False)
             self.embeddings.move_to_end(key)
@@ -158,6 +160,8 @@ def load_pipeline(model, local_files_only=False):
         vae=AutoencoderKLFlux2.from_pretrained(root / "vae", torch_dtype=torch.float32).to(DEVICE).eval(),
     )
     pipe.root = root
+    # The pipeline class is defined here; provenance records the bundle source it patches and runs.
+    pipe.pipeline_file = root / "pipeline_moss_image.py"
     pipe.embeddings = OrderedDict()
     pipe.use_transformer()
     return pipe

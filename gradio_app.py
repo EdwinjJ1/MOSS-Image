@@ -306,6 +306,11 @@ class ModelRunner:
                 raise ValueError(
                     "GPU memory exhausted. Try fewer/smaller images or a lower-memory offload mode."
                 ) from exc
+            except Exception:
+                # A failed MPS prompt stage leaves the pipeline without its DiT; reload it next time.
+                if self.pipe is not None and self.pipe.transformer is None:
+                    self.unload()
+                raise
             report(0, desc="Saving images and parameters")
             folder = self.output_dir / uuid4().hex
             folder.mkdir(parents=True, exist_ok=True)
@@ -324,6 +329,10 @@ class ModelRunner:
                         p for p in (root / "tokenizer").iterdir() if p.suffix in (".json", ".jinja", ".txt")
                     )
                 )
+            # On MPS the pipeline class is mps_runtime's wrapper around the bundle's pipeline source.
+            pipeline_file = getattr(self.pipe, "pipeline_file", None)
+            wrapper = Path(mps_runtime.__file__) if pipeline_file else None
+            pipeline_file = Path(pipeline_file or inspect.getfile(type(self.pipe)))
             record = {
                 "schema_version": 2,
                 "model": root.name if root.is_dir() else model,
@@ -333,9 +342,8 @@ class ModelRunner:
                 "sampler": "Euler",
                 "weight_dtype": str(self.pipe.transformer.dtype).removeprefix("torch."),
                 "vae_dtype": "float32",
-                "pipeline_sha256": hashlib.sha256(
-                    Path(inspect.getfile(type(self.pipe))).read_bytes()
-                ).hexdigest(),
+                "pipeline_sha256": hashlib.sha256(pipeline_file.read_bytes()).hexdigest(),
+                "mps_runtime_sha256": hashlib.sha256(wrapper.read_bytes()).hexdigest() if wrapper else None,
                 "model_config_sha256": {
                     str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in configs

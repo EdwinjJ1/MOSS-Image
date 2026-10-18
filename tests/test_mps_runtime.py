@@ -1,4 +1,6 @@
 """Regression checks for Mac adaptation; no weights or GPU required."""
+import hashlib
+import json
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -7,8 +9,20 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from PIL import Image
 
 import mps_runtime as runtime
+
+MODEL = "OpenMOSS-Team/MOSS-Image-Base"
+
+
+def fake_pipe(**attributes):
+    transformer = SimpleNamespace(config=SimpleNamespace(num_layers=32), dtype=torch.bfloat16)
+    return SimpleNamespace(transformer=transformer, remove_all_hooks=Mock(), **attributes)
+
+
+def fake_output():
+    return SimpleNamespace(images=[Image.new("RGB", (16, 16))])
 
 
 class TimestepTests(unittest.TestCase):
@@ -46,7 +60,8 @@ class StagingTests(unittest.TestCase):
                 if self.text_encoder is None:
                     raise AssertionError("Encoding requires the text encoder")
                 events.append("encode")
-                return torch.zeros(1, 2, 4), torch.ones(1, 2)
+                weight = torch.ones(4, requires_grad=True)  # stands in for text-encoder parameters
+                return torch.zeros(1, 2, 4) * weight, torch.ones(1, 2)
 
             def __call__(self, prompt, **kwargs):
                 if self.transformer is None or self.text_encoder is not None:
@@ -96,6 +111,75 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(len(self.pipe.embeddings), runtime.CACHED_PROMPTS)
         self.assertIn((("prompt-0",), 4096), self.pipe.embeddings)
         self.assertNotIn((("prompt-1",), 4096), self.pipe.embeddings)
+
+    def test_cached_embeddings_hold_no_autograd_graph(self):
+        # A graph would keep the released text encoder's weights and activations alive.
+        embeds, _ = self.pipe.encode_prompt("coffee")
+        self.assertFalse(embeds.requires_grad)
+        self.assertIsNone(embeds.grad_fn)
+
+    def test_load_pipeline_records_the_bundle_pipeline_it_executes(self):
+        class BasePipeline:
+            def __init__(self, **components):
+                self.text_encoder = None
+                self.__dict__.update(components)
+
+        module = SimpleNamespace(
+            MOSSImagePipeline=BasePipeline, MOSSImageTransformer=Mock(), MOSSImageScheduler=Mock()
+        )
+        root = Path("bundle")
+        with patch.object(runtime, "_bundle_root", return_value=root), \
+             patch.object(runtime, "_import_pipeline_module", return_value=module), \
+             patch.object(runtime.AutoTokenizer, "from_pretrained"), \
+             patch.object(runtime.AutoencoderKLFlux2, "from_pretrained"):
+            pipe = runtime.load_pipeline("model")
+        self.assertEqual(pipe.pipeline_file, root / "pipeline_moss_image.py")
+
+
+class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        import gradio_app
+
+        self.app = gradio_app
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.runner = gradio_app.ModelRunner(directory.name, local_files_only=True)
+        self.config = gradio_app.GenerationConfig(prompt="coffee")
+        for target, name in ((gradio_app, "set_scheduler"), (runtime, "empty_cache")):
+            patcher = patch.object(target, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_failed_prompt_stage_releases_pipeline_and_reloads_it(self):
+        broken, fresh = fake_pipe(), fake_pipe()
+
+        def run(pipe, *args, **kwargs):
+            if pipe is broken:
+                pipe.transformer = None  # released for the text encoder, which then failed
+                raise RuntimeError("MPS backend out of memory")
+            return fake_output()
+
+        with patch.object(self.app, "load_pipeline", side_effect=[broken, fresh]) as load, \
+             patch.object(self.app, "generate_with_progress", side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                self.runner.generate(MODEL, self.config)
+            self.assertIsNone(self.runner.pipe)
+            broken.remove_all_hooks.assert_called_once()
+            self.runner.generate(MODEL, self.config)
+        self.assertEqual(load.call_count, 2)
+
+    def test_mps_provenance_hashes_bundle_pipeline_and_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "pipeline_moss_image.py"
+            source.write_text("# bundle pipeline\n")
+            with patch.object(self.app, "load_pipeline", return_value=fake_pipe(pipeline_file=source)), \
+                 patch.object(self.app, "generate_with_progress", return_value=fake_output()):
+                _, metadata, _ = self.runner.generate(MODEL, self.config)
+        record = json.loads(Path(metadata).read_text())
+        self.assertEqual(record["pipeline_sha256"], hashlib.sha256(b"# bundle pipeline\n").hexdigest())
+        self.assertEqual(
+            record["mps_runtime_sha256"], hashlib.sha256(Path(runtime.__file__).read_bytes()).hexdigest()
+        )
 
 
 class IntegrationTests(unittest.TestCase):
